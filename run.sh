@@ -45,38 +45,18 @@ if [[ "$NCPU" =~ ^[0-9]+$ ]] && (( NCPU >= NT )); then
     export GOMP_SPINCOUNT=infinite
 fi
 
-# 内存：优先使用与 CPU 节点 1 相邻、容量像 HBM（1～32 GB）的纯内存节点（本机为 HBM node 17，4 GB，距离 61），
-# 放不下时自动回落本地 DDR。与 T2 的 `numactl -m16` 同理，但 4 GB HBM 装不下大用例的全部矩阵，所以用 --preferred 而非 -m。
-# 容量判据是为了避免把普通 DDR/远端内存池误当 HBM。
-hbm=""
-if [[ -r /sys/devices/system/node/node$cpunode/distance ]]; then
-    read -ra dist < /sys/devices/system/node/node$cpunode/distance
-    best=999
-    for n in "${!dist[@]}"; do
-        [[ -d /sys/devices/system/node/node$n ]] || continue
-        cpulist=$(cat /sys/devices/system/node/node$n/cpulist 2>/dev/null)
-        [[ -z "$cpulist" ]] || continue          # 只考虑没有 CPU 的纯内存节点
-        totkb=$(awk '/MemTotal:/{print $4}' /sys/devices/system/node/node$n/meminfo 2>/dev/null)
-        [[ "$totkb" =~ ^[0-9]+$ ]] || continue
-        (( totkb >= 1048576 && totkb <= 33554432 )) || continue   # 1～32 GB
-        if (( dist[n] < best )); then best=${dist[n]}; hbm=$n; fi
-    done
-    (( best > 70 )) && hbm=""                    # 远端节点不用
-fi
-MEMOPT=""
-if [[ -n "$hbm" ]] && numactl -N $cpunode --preferred=$hbm true >/dev/null 2>&1; then
-    MEMOPT="--preferred=$hbm"
-fi
+# 内存：v24 极简版——不设任何 numactl 内存参数，也不在库内做 set_mempolicy/页迁移；
+# 算子只用 mmap+mbind 把自己的打包缓冲放到相邻 HBM 节点（识别逻辑在 zgemm.c，纯只读探测）。
 # 环境诊断（stderr）：判题机与开发机不同时便于定位
 {
-    echo "[run.sh] host=$(hostname 2>/dev/null) cpus_in_node$cpunode=$NCPU threads=$NT numactl -N $cpunode $MEMOPT"
+    echo "[run.sh] host=$(hostname 2>/dev/null) cpus_in_node$cpunode=$NCPU threads=$NT numactl -N $cpunode"
     echo "[run.sh] cpu: $(grep -m1 'model name\|CPU part\|Hardware' /proc/cpuinfo 2>/dev/null | head -1)  features: $(grep -m1 Features /proc/cpuinfo 2>/dev/null | tr ' ' '\n' | grep -E '^(sve|sve2|sme|smef64f64|sme2)$' | tr '\n' ' ')"
     echo "[run.sh] nodes: $(numactl -H 2>/dev/null | grep -E 'available|node [0-9]+ size' | tr '\n' ';' | cut -c1-400)"
     echo "[run.sh] numa_balancing=$(cat /proc/sys/kernel/numa_balancing 2>/dev/null) thp=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null) freq_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null)"
 } >&2
 
 if command -v numactl >/dev/null 2>&1 && numactl -N $cpunode true >/dev/null 2>&1; then
-    RUN="numactl -N $cpunode $MEMOPT"
+    RUN="numactl -N $cpunode"
 else
     echo "[run.sh] numactl 不可用或节点 $cpunode 不可用，直接运行" >&2
     RUN=""

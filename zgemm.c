@@ -178,18 +178,15 @@ static long node_free_bytes(int node)
 #ifndef SYS_get_mempolicy
 #define SYS_get_mempolicy 236
 #endif
-#ifndef SYS_migrate_pages
-#define SYS_migrate_pages 238
-#endif
 #ifndef SYS_set_mempolicy
 #define SYS_set_mempolicy 237
 #endif
 #define MPOL_INTERLEAVE_ 3
+#define MPOL_PREFERRED_ 1
 #define MPOL_F_NODE_ 1
 #define MPOL_F_ADDR_ 2
 
 static int g_cpu_node = -1;   // 当前进程运行的 CPU 所属 NUMA 节点
-static int g_c_interleave = 0; // 首次调用把本线程内存策略改成 HBM/本地 DDR 交错（ZGEMM_CINTL 默认开，见 ensure_buffers）
 
 // 地址 p 所在页的内存节点（未映射返回 -1）
 static int page_node_of(const void* p)
@@ -197,15 +194,6 @@ static int page_node_of(const void* p)
     int node = -1;
     if (syscall(SYS_get_mempolicy, &node, NULL, 0, (unsigned long)p, MPOL_F_NODE_ | MPOL_F_ADDR_) != 0) return -1;
     return node;
-}
-
-// 把本进程在 from 节点上的全部页迁到 to 节点（用于腾空 HBM；只在首次调用、非计时阶段执行）
-static long migrate_all_pages(int from, int to)
-{
-    unsigned long oldm[16] = {0}, newm[16] = {0};
-    oldm[from / 64] |= 1UL << (from % 64);
-    newm[to / 64] |= 1UL << (to % 64);
-    return syscall(SYS_migrate_pages, 0, (unsigned long)(sizeof(oldm) * 8), oldm, newm);
 }
 
 static long node_total_bytes(int node)
@@ -319,88 +307,19 @@ static double** g_packB = NULL;
 static size_t* g_packB_cap = NULL;
 static int g_packB_n = 0;
 static int g_mem_node = -2;   // -2 未决定
-// "气球"：首次（校验）调用时在 HBM 占住一块，使基准程序随后分配的计时用 C 只有 ZGEMM_CHBM% 落在 HBM，
-// 其余落到本地 DDR——C 的读写流量由 HBM 与 DDR 两条通道分担（A 流全部在 HBM）。默认 100 = 不占。
-static void* g_balloon = NULL;
-static size_t g_balloon_bytes = 0;
-static size_t g_c_bytes_hint = 0;
-// DDR 大页池：C 装不满 HBM 时（case3），基准程序随后在 DDR 上分配的那部分 C_copy 会因为 DDR 空闲内存碎片化
-// （THP defrag=never）只拿到一半大页（smaps 实测 54%），其余 4 KB 页让每块块首多 17 次页表遍历（≈ case3 的 4%）。
-// 首次调用时先在 DDR 上占一块大页池（趁 2 MB 空闲块还多），迁移与分配 arena 之后、首次调用返回前释放——
-// 释放回去的 2 MB 块正好被紧随其后的 C_copy 缺页拿走。
-static void* g_hpool = NULL;
-static size_t g_hpool_bytes = 0;
 
 // 分配 A 块：Mb 个块，每块 blk_bytes；每 ddr_every 块中有 1 块放到副 arena（ddr_every=0 表示全部主 arena）
 static void ensure_buffers(long Mb, size_t blk_bytes, long ddr_every, int nth, size_t b_bytes)
 {
     size_t a_bytes = (size_t)Mb * blk_bytes;
     if (g_mem_node == -2) {
-        // 首次调用（基准程序的校验调用，不计时）：若存在近端 HBM 节点，先把本进程已落在其上的页
-        // （run.sh 用 --preferred 时基准程序的原始 A/B/C 会占满 HBM）迁到本地 DDR，腾出空间给
-        // 本实现的打包缓冲，以及基准程序随后为计时分配的 C_copy。
-        int cand = choose_mem_node(-1);
-        // DDR 大页池（见 g_hpool 说明）：只在 C 放不进 HBM 时占，大小 = C 超出 HBM 的部分 + 256 MB，上限 ZGEMM_HPOOL_MB（默认 2048）
-        // 实测（case3）：C_copy 的大页比例没有变化（AnonHugePages 8.1 → 7.1 GB），块首 j0 3258 vs 3265，无收益。默认关（ZGEMM_HPOOL=1 开）。
-        if (cand >= 0 && g_cpu_node >= 0 && g_c_bytes_hint > 0 && env_int("ZGEMM_HPOOL", 0)) {
-            long hbm_total = node_total_bytes(cand);
-            long over = (long)g_c_bytes_hint + (long)(a_bytes + (size_t)nth * b_bytes) + (256L << 20) - hbm_total;
-            long cap = (long)env_int("ZGEMM_HPOOL_MB", 2048) << 20;
-            if (over > (64L << 20)) {
-                size_t pool = (size_t)(over > cap ? cap : over);
-                g_hpool = zg_alloc_on(pool, g_cpu_node);            // 绑到 CPU 节点（DDR）+ MADV_HUGEPAGE
-                if (g_hpool) {
-                    volatile char* pc = (volatile char*)g_hpool;
-                    for (size_t off = 0; off < pool; off += (2u << 20)) pc[off] = 1;   // 触页：每 2 MB 一次
-                    g_hpool_bytes = pool;
-                }
-            }
-        }
-        if (cand >= 0 && g_cpu_node >= 0 && env_int("ZGEMM_EVICT", 1)) {
-            long freeb = node_free_bytes(cand);
-            long total = -1;
-            {
-                char path[128], line[256];
-                snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/meminfo", cand);
-                FILE* f = fopen(path, "r");
-                if (f) {
-                    while (fgets(line, sizeof(line), f)) { char* p = strstr(line, "MemTotal:"); if (p) { total = atol(p + 9) * 1024; break; } }
-                    fclose(f);
-                }
-            }
-            // 已被占用超过 1/8 时才值得迁移
-            if (total > 0 && freeb < total - total / 8) migrate_all_pages(cand, g_cpu_node);
-        }
+        // 首次调用（基准程序的校验调用，不计时）：识别近端 HBM 节点，仅用于放置本实现自己的打包缓冲
+        //（mmap+mbind，见 zg_alloc_on）。v24：不做 set_mempolicy、不做页迁移，不影响基准程序缓冲区的放置。
         g_mem_node = choose_mem_node((long)(a_bytes + (size_t)nth * b_bytes));
-        int chbm = env_int("ZGEMM_CHBM", 100);
-        if (g_mem_node >= 0 && chbm < 100 && g_c_bytes_hint > 0) {
-            long freeb = node_free_bytes(g_mem_node) - (long)(a_bytes + (size_t)nth * b_bytes) - (64L << 20);
-            long want = (long)((double)g_c_bytes_hint * chbm / 100.0);
-            long bal = freeb - want;
-            if (bal > (64L << 20)) {
-                g_balloon = zg_alloc_on((size_t)bal, g_mem_node);
-                if (g_balloon) { memset(g_balloon, 1, (size_t)bal); g_balloon_bytes = (size_t)bal; }
-            }
-        }
-        // C 交错（ZGEMM_CINTL，默认开；=0 关闭）：C 装不进 HBM 时（case3 的 4.67 GB > HBM 剩余 ~3.7 GB），基准程序随后分配的 C_copy
-        // 溢出部分在 --preferred 策略下只能拿 4 KB 页（5.10 内核对首选节点的 THP 分配带 __GFP_THISNODE，失败即退 4 KB 页，
-        // defrag=never 不重试），每块块首多 17 次页表遍历 ≈ case3 的 3%。这里把本线程（也就是基准程序随后做 malloc+memcpy
-        // 首触 C_copy 的线程）的内存策略改为 HBM/本地 DDR 交错：每 2 MB 轮换节点，交错路径的 THP 分配不带 THISNODE，
-        // HBM 满了顺着 zonelist 落到本地 DDR 仍是 2 MB 页。C 约一半在 HBM、一半在 DDR（实测 50% 份额 + 2 MB 页与 18% 份额
-        // 一样快，见 NOTES）。只在首次（校验）调用里做一次 set_mempolicy，只影响本进程之后的分配，不碰别人的页。
-        if (g_mem_node >= 0 && g_cpu_node >= 0 && g_c_bytes_hint > 0 && env_int("ZGEMM_CINTL", 1)) {
-            long freeb = node_free_bytes(g_mem_node) - (long)(a_bytes + (size_t)nth * b_bytes) - (128L << 20);
-            if ((long)g_c_bytes_hint > freeb) {
-                unsigned long mask[16] = {0};
-                mask[g_mem_node / 64] |= 1UL << (g_mem_node % 64);
-                mask[g_cpu_node / 64] |= 1UL << (g_cpu_node % 64);
-                if (syscall(SYS_set_mempolicy, MPOL_INTERLEAVE_, mask, (unsigned long)(sizeof(mask) * 8)) == 0) g_c_interleave = 1;
-            }
-        }
         if (env_int("ZGEMM_DIAG", 1)) {
             unsigned long vl = 0; asm volatile("rdsvl %0, #1" : "=r"(vl));
-            fprintf(stderr, "[zgemm] 环境：线程 %d，可绑核 %d，CPU 节点 %d，内存节点 %d（-1 = 默认策略），流式 VL %lu B，"
-                            "HBM 气球 %zu MB，DDR 大页池 %zu MB，C 交错 %d\n", nth, g_ncpu, g_cpu_node, g_mem_node, vl, g_balloon_bytes >> 20, g_hpool_bytes >> 20, g_c_interleave);
+            fprintf(stderr, "[zgemm] 环境：线程 %d，可绑核 %d，CPU 节点 %d，内存节点 %d（-1 = 默认策略），流式 VL %lu B\n",
+                    nth, g_ncpu, g_cpu_node, g_mem_node, vl);
         }
     }
     long n_ddr = (ddr_every > 0 && g_mem_node >= 0) ? Mb / ddr_every : 0;
@@ -2754,11 +2673,8 @@ static void zgemm_sme_pass(long M, long N, long K, zdouble alpha, const acc_t* A
     // C 行段是否跨 5 条 cache line（基址或行距未按 64 B 对齐时）：预取每行 5 行 cache line
     const long c_pf_row = (((uintptr_t)C % 64) == 0 && (ldc * (long)sizeof(zdouble) * F) % 64 == 0 && geo.delta == 0) ? 256 : 320;
     // C 预取提前量：行交织 F=1 用 8 行，F>1 用 12 行（见 PF_C_HALFROW 处说明）；ZGEMM_PFCJIT=8/12 强制。
-    // C 交错生效时（case3，C 全 2 MB 页）恢复 8：12 是给 DDR 4 KB 页的长延迟留的，现在提前太多反而被 L1 挤出
-    //（同作业 fast bench ×3：PFCJIT=8 182.7 vs 默认 12 183.6~183.8，+0.5%）。首次（校验）调用时 g_c_interleave
-    // 尚未置位、仍用 12，不影响计时调用。
     const long pfc_env = env_int("ZGEMM_PFCJIT", 0);
-    const int pfc_ahead = (pfc_env == 4 || pfc_env == 12 || pfc_env == 8 || pfc_env == 16 || pfc_env == 17) ? (int)pfc_env : (g_c_interleave ? 4 : (F > 1 ? 12 : 8));
+    const int pfc_ahead = (pfc_env == 4 || pfc_env == 12 || pfc_env == 8 || pfc_env == 16 || pfc_env == 17) ? (int)pfc_env : (F > 1 ? 12 : 8);
     // 注：曾试过把余数子面板放进"共享池"由先完成的线程细粒度认领——case3 变慢 19%：多个线程同时写同一列块的 C
     // （行距 128 KB，同列块各行在同一 DRAM bank）会撞 bank；线程各自独占列块才能把 bank 分开。
     // 列块拥有者 = 线程组（R 个线程共用同一列范围、共用同一 A 段池，各自处理不同的 A 块，不会同时写同一 C 列）。
@@ -2794,7 +2710,7 @@ static void zgemm_sme_pass(long M, long N, long K, zdouble alpha, const acc_t* A
     const size_t chunk_stride_d = (size_t)chunk_cols_max * K * 2;              // 每个列块面板的双精度数
     const size_t b_bytes_all = (size_t)nchunks * chunk_stride_d * sizeof(double);
     const size_t blk_bytes_ = r175 ? (size_t)K * 288 : ZG_BLK_BYTES(K);   // 17.5 行：主体 K×256 + 条带流 K×32
-    if (g_mem_node == -2) { g_c_bytes_hint = (size_t)M * N * sizeof(zdouble); ensure_buffers(Mb, blk_bytes_, 0, nth, b_bytes_all); }
+    if (g_mem_node == -2) { ensure_buffers(Mb, blk_bytes_, 0, nth, b_bytes_all); }
     // A 块在 HBM/DDR 间的分配比例：按 C 实际落在 HBM 的比例，使两条通道的传输时间相等
     long ddr_every = 0;
     // A 块分流到 DDR：判题机（2 GHz）实测 25% 分流 7817/8195/7051 vs 不分流 7855/8243/7174——没有收益，
@@ -3499,7 +3415,6 @@ void cblas_zgemm(const enum CBLAS_ORDER Order, const enum CBLAS_TRANSPOSE TransA
                     g_mem_node >= 0 ? node_free_bytes(g_mem_node) >> 20 : -1L, thp);
         }
         zgemm_sme(Mp, Np, K, alpha_v, &Aa, &Ba, beta_v, Cp, ldc);
-        if (g_hpool) { zg_free(g_hpool, g_hpool_bytes); g_hpool = NULL; }   // 首次（校验）调用结束：把 DDR 大页还给系统，留给随后分配的 C_copy
         // 注：v10～v13 曾在此起后台线程 / malloc 钩子，把基准程序随后分配的 C_copy 溢出 HBM 的尾部改绑 DDR 大页（case3 +2.7%）；
         // 正式版按"不做任何环境探测/干预"的原则去掉，见 NOTES.md。
         if (prof) { clock_gettime(CLOCK_MONOTONIC, &ts1); fprintf(stderr, "[zgemm prof] cblas_zgemm 全程 %.3f ms\n", (ts1.tv_sec - ts0.tv_sec) * 1e3 + (ts1.tv_nsec - ts0.tv_nsec) * 1e-6); }

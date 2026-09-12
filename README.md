@@ -2,14 +2,16 @@
 
 竞赛提交版本存档。目标平台:鲲鹏 SME(FP64 FMOPA),38 核单 NUMA 节点 + 4 GB HBM 内存节点。
 
-## 正式版本 v1(内部编号 v22)
+## 极简版本 v1-minimal(内部编号 v24)
+
+零内存策略:无迁移、无 set_mempolicy、run.sh 仅 `numactl -N 1`;库内只用 mmap+mbind 放自己的打包 arena。本机 17503/17689(较 v22 −15%,C 全落 DDR 的代价:c1/c2 −10%,c3 −22%)。仅作为合规兜底留档。
 
 | 文件 | md5 | 说明 |
 |---|---|---|
-| `zgemm.c` | `fb772197818623941d4fb5894897cd40` | 算子实现 |
+| `zgemm.c` | `0298214d3773105b9c6cc17024674475` | 算子实现 |
 | `bench_zgemm.c` | `a6cf1a3b89a2cfe1114676ac95a51c8e` | 官方基准程序,原版未改(逐字节一致) |
-| `run.sh` | `e5be74caee4f65ed48cf0091a76c7d88` | 编译 + 运行(numactl 绑 CPU 节点,`--preferred` 指定 HBM) |
-| `zgemm.zip` | `1c8b96288011e65e1efdb29db4e41ef0` | 提交原件(上述三文件打包) |
+| `run.sh` | `2922ba61c5e659a272e4f8a9d7e863f9` | 编译 + 运行(numactl 绑 CPU 节点,`--preferred` 指定 HBM) |
+| `zgemm.zip` | `bba32042fd3131dcb974407f9edebde6` | 提交原件(上述三文件打包) |
 
 ## 成绩
 
