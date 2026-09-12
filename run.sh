@@ -65,7 +65,7 @@ if [[ -r /sys/devices/system/node/node$cpunode/distance ]]; then
 fi
 MEMOPT=""
 if [[ -n "$hbm" ]] && numactl -N $cpunode --preferred=$hbm true >/dev/null 2>&1; then
-    MEMOPT="--preferred=$hbm"
+    MEMOPT=""   # v23：C_copy 的 HBM 放置改由库内任务策略承担，避免原始 A/B/C 占满 HBM 后的首调迁移
 fi
 # 环境诊断（stderr）：判题机与开发机不同时便于定位
 {

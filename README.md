@@ -2,14 +2,16 @@
 
 竞赛提交版本存档。目标平台:鲲鹏 SME(FP64 FMOPA),38 核单 NUMA 节点 + 4 GB HBM 内存节点。
 
-## 正式版本 v1(内部编号 v22)
+## 回退版本 v1-nomigrate(内部编号 v23)
+
+与 v22 唯一差别:去掉 migrate_pages 页迁移与 run.sh 的 `--preferred`,改为首调用内 `set_mempolicy(preferred=HBM)`(C 装不下时交错)。本机 20588/20595(较 v22 −0.65%)。
 
 | 文件 | md5 | 说明 |
 |---|---|---|
-| `zgemm.c` | `fb772197818623941d4fb5894897cd40` | 算子实现 |
+| `zgemm.c` | `89d340dc6c2b9d75b0d4c79dd589f98f` | 算子实现 |
 | `bench_zgemm.c` | `a6cf1a3b89a2cfe1114676ac95a51c8e` | 官方基准程序,原版未改(逐字节一致) |
-| `run.sh` | `e5be74caee4f65ed48cf0091a76c7d88` | 编译 + 运行(numactl 绑 CPU 节点,`--preferred` 指定 HBM) |
-| `zgemm.zip` | `1c8b96288011e65e1efdb29db4e41ef0` | 提交原件(上述三文件打包) |
+| `run.sh` | `842d6092919ff502447834f2a92c3297` | 编译 + 运行(numactl 绑 CPU 节点,`--preferred` 指定 HBM) |
+| `zgemm.zip` | `22edb8f784a637e290695b51ca799120` | 提交原件(上述三文件打包) |
 
 ## 成绩
 

@@ -178,13 +178,11 @@ static long node_free_bytes(int node)
 #ifndef SYS_get_mempolicy
 #define SYS_get_mempolicy 236
 #endif
-#ifndef SYS_migrate_pages
-#define SYS_migrate_pages 238
-#endif
 #ifndef SYS_set_mempolicy
 #define SYS_set_mempolicy 237
 #endif
 #define MPOL_INTERLEAVE_ 3
+#define MPOL_PREFERRED_ 1
 #define MPOL_F_NODE_ 1
 #define MPOL_F_ADDR_ 2
 
@@ -197,15 +195,6 @@ static int page_node_of(const void* p)
     int node = -1;
     if (syscall(SYS_get_mempolicy, &node, NULL, 0, (unsigned long)p, MPOL_F_NODE_ | MPOL_F_ADDR_) != 0) return -1;
     return node;
-}
-
-// 把本进程在 from 节点上的全部页迁到 to 节点（用于腾空 HBM；只在首次调用、非计时阶段执行）
-static long migrate_all_pages(int from, int to)
-{
-    unsigned long oldm[16] = {0}, newm[16] = {0};
-    oldm[from / 64] |= 1UL << (from % 64);
-    newm[to / 64] |= 1UL << (to % 64);
-    return syscall(SYS_migrate_pages, 0, (unsigned long)(sizeof(oldm) * 8), oldm, newm);
 }
 
 static long node_total_bytes(int node)
@@ -356,22 +345,15 @@ static void ensure_buffers(long Mb, size_t blk_bytes, long ddr_every, int nth, s
                 }
             }
         }
-        if (cand >= 0 && g_cpu_node >= 0 && env_int("ZGEMM_EVICT", 1)) {
-            long freeb = node_free_bytes(cand);
-            long total = -1;
-            {
-                char path[128], line[256];
-                snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/meminfo", cand);
-                FILE* f = fopen(path, "r");
-                if (f) {
-                    while (fgets(line, sizeof(line), f)) { char* p = strstr(line, "MemTotal:"); if (p) { total = atol(p + 9) * 1024; break; } }
-                    fclose(f);
-                }
-            }
-            // 已被占用超过 1/8 时才值得迁移
-            if (total > 0 && freeb < total - total / 8) migrate_all_pages(cand, g_cpu_node);
-        }
+        // v23：run.sh 不再 --preferred=HBM，原始 A/B/C 从一开始就在 DDR——EVICT/migrate_pages 已无触发条件，整段删除。
         g_mem_node = choose_mem_node((long)(a_bytes + (size_t)nth * b_bytes));
+        // v23：run.sh 不再传 --preferred=HBM（原始 A/B/C 因此落 DDR，无需 EVICT 迁移）；改由这里把任务策略设为
+        // preferred=HBM，使基准程序随后分配的 C_copy 落 HBM 大页。C 装不下时下方交错分支会覆盖本策略。
+        if (g_mem_node >= 0 && env_int("ZGEMM_CPREF", 1)) {
+            unsigned long pmask[16] = {0};
+            pmask[g_mem_node / 64] |= 1UL << (g_mem_node % 64);
+            syscall(SYS_set_mempolicy, MPOL_PREFERRED_, pmask, (unsigned long)(sizeof(pmask) * 8));
+        }
         int chbm = env_int("ZGEMM_CHBM", 100);
         if (g_mem_node >= 0 && chbm < 100 && g_c_bytes_hint > 0) {
             long freeb = node_free_bytes(g_mem_node) - (long)(a_bytes + (size_t)nth * b_bytes) - (64L << 20);
